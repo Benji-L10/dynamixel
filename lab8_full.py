@@ -1,22 +1,16 @@
 """
 Lab 8 (Final Project): Vision-Guided Robotic Pick-and-Place Sorting System
-Option 2: Position-Based Visual Servoing (PBVS)
-
 Team: [Your Team Name]
 Members: [Team Member Names]
 
-Pipeline:
-  Detect balls (color + image circle) →
-  PnP for 3D center in camera frame →
-  Transform to robot base frame →
-  PBVS (PID in task space) for approach / grasp / lift →
-  Position trajectories for transport to bins and home.
+This script implements a complete robotic sorting system that:
+1. Detects colored balls using computer vision
+2. Localizes them in 3D space using camera-robot calibration
+3. Plans smooth trajectories to pick up each ball
+4. Sorts them into color-coded bins
 
-Requires:
-  - classes/Robot.py (OpenManipulator-X interface)
-  - classes/Realsense.py (RealSense RGB stream + intrinsics)
-  - classes/TrajPlanner.py (optional; used here only for simple position segments via IK)
-  - camera_robot_transform.npy (Lab 6.2 result)
+System Architecture:
+    Detection → Localization → Motion Planning → Execution → Repeat
 """
 
 import numpy as np
@@ -27,435 +21,656 @@ from classes.Robot import Robot
 from classes.Realsense import Realsense
 from classes.TrajPlanner import TrajPlanner
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# ============================================================================
+# CONFIGURATION PARAMETERS
+# ============================================================================
 
-# Physical ball radius in millimeters (measure your set)
-BALL_RADIUS = 15.0
+# Physical parameters
+BALL_RADIUS = 15  # Physical radius of balls in millimeters
 
-# Control loop timing
-DT = 0.05  # 20 Hz
+# Motion control parameters
+TRAJECTORY_TIME = 2.5  # Time for each trajectory segment in seconds
+NUM_POINTS = 100       # Number of waypoints in each trajectory
 
-# PID gains for PBVS (start with Lab 7 tuned values)
-Kp = np.diag([1.0, 1.0, 1.0])
-Ki = np.diag([0.10, 0.10, 0.10])
-Kd = np.diag([0.10, 0.10, 0.10])
+# Workspace safety bounds (millimeters, in robot frame)
+# TODO: Adjust these based on your setup to prevent collisions
+X_MIN, X_MAX = 50, 230   # Forward/backward limits
+Y_MIN, Y_MAX = -150, 150 # Left/right limits
 
-# Joint safety (deg/s)
-VEL_CLAMP = 60.0
-VEL_DEADBAND = 0.5
-
-# Workspace bounds (mm, robot frame) to ignore outliers
-X_MIN, X_MAX = 50, 230
-Y_MIN, Y_MAX = -150, 150
-
-# Home posture: [x, y, z, pitch] (mm, mm, mm, deg)
+# Home position: [x, y, z, pitch] in mm and degrees
+# This position should give the camera a clear view of the workspace
 HOME_POSITION = [100, 0, 220, -15]
 
-# Bins: [x, y, z, pitch] (mm, mm, mm, deg)
+# Sorting bin locations: [x, y, z, pitch] in mm and degrees
+# TODO: Adjust these positions based on your physical bin locations
 BINS = {
-    'red':    [  0, -220, 150, -40],
+    'red': [0, -220, 150, -40],
     'orange': [120, -220, 150, -40],
-    'blue':   [  0,  220, 150, -45],
-    'yellow': [120,  220, 150, -45],
+    'blue': [0, 220, 150, -45],
+    'yellow': [120, 220, 150, -45]
 }
 
-# Approach/Grasp/Lift targets relative to ball (mm)
-APPROACH_OFFSET = np.array([0.0, 0.0, 80.0])  # above ball to keep visibility
-GRASP_Z        = 39.0                         # table height + margin
-LIFT_Z         = 100.0
+# ============================================================================
+# COMPUTER VISION: BALL DETECTION AND POSE ESTIMATION
+# ============================================================================
 
-# Trajectory settings for non-visual transport segments
-TRAJECTORY_TIME = 2.0
-NUM_POINTS = 100
-
-
-# =============================================================================
-# VISION HELPERS
-# =============================================================================
-
-def get_ball_pose(corners_px: np.ndarray, intrinsics, radius_mm: float):
+def get_ball_pose(corners: np.ndarray, intrinsics: any, radius: float) -> tuple:
     """
-    Estimate ball center using PnP on 4 "equator" points of the image circle.
-    corners_px: 4x2 pixel points in order [left, right, bottom, top].
-    intrinsics: RealSense intrinsics object (fx, fy, ppx, ppy, coeffs)
-    radius_mm:  sphere radius (mm)
+    Estimate the 3D pose of a detected sphere using the Perspective-n-Point (PnP) algorithm.
+    
+    The PnP algorithm finds the position and orientation of an object by matching:
+    - Known 3D points on the object (object_points)
+    - Corresponding 2D points in the image (image_points)
+    
+    For a sphere, we create artificial "corner" points on the sphere's visible boundary
+    to establish these correspondences.
+    
+    Args:
+        corners: A 4x2 array of circle boundary points [top, bottom, left, right]
+        intrinsics: Camera intrinsic parameters from RealSense
+        radius: The sphere's physical radius in millimeters
+    
     Returns:
-        rot_matrix (3x3), tvec (3x1) in camera frame (mm)
+        tuple: (rotation_matrix, translation_vector)
+            - rotation_matrix: 3x3 matrix (not used for spheres, but returned by PnP)
+            - translation_vector: 3x1 vector giving sphere center in camera frame (mm)
+    
+    Raises:
+        RuntimeError: If PnP algorithm fails to find a solution
     """
-    # 3D object points on sphere equator (match corners order)
+    # ==========================================================================
+    # TODO: Define 3D object points on the sphere
+    # ==========================================================================
+    # Hint: Create 4 points on the sphere's "equator" as viewed from camera
+    # These should correspond to the top, bottom, left, and right boundary points
+    # Example structure:
+    #   Point 1: [-radius, 0, 0]  (left edge of sphere)
+    #   Point 2: [+radius, 0, 0]  (right edge of sphere)
+    #   Point 3: [0, +radius, 0]  (top edge of sphere)
+    #   Point 4: [0, -radius, 0]  (bottom edge of sphere)
+    # YOUR CODE HERE
     object_points = np.array(
-        [[-radius_mm,   0.0, 0.0],   # left
-         [ radius_mm,   0.0, 0.0],   # right
-         [ 0.0,       -radius_mm, 0.0],   # bottom
-         [ 0.0,        radius_mm, 0.0]],  # top
+        [
+            [-radius, 0.0, 0.0],  # left
+            [ radius, 0.0, 0.0],  # right
+            [ 0.0,   radius, 0.0],# top
+            [ 0.0,  -radius, 0.0] # bottom
+        ],
         dtype=np.float32
     )
+    
+    
+    # ==========================================================================
+    # TODO: Prepare image points (the detected corner points in pixels)
+    # ==========================================================================
+    # Hint: Reshape corners array to (4, 2) and ensure float32 type
+    # YOUR CODE HERE    
+    image_points = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    
 
-    image_points = np.asarray(corners_px, dtype=np.float32).reshape(-1, 2)
-
-    K = np.array([[intrinsics.fx, 0.0,            intrinsics.ppx],
-                  [0.0,           intrinsics.fy,  intrinsics.ppy],
-                  [0.0,           0.0,            1.0]], dtype=np.float32)
-
+    # ==========================================================================
+    # TODO: Construct camera intrinsic matrix
+    # ==========================================================================
+    # The camera matrix format is:
+    #   [[fx,  0, cx],
+    #    [ 0, fy, cy],
+    #    [ 0,  0,  1]]
+    # where fx, fy are focal lengths and cx, cy are principal point coordinates
+    # Hint: Access intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy
+    # YOUR CODE HERE
+    K = np.array(
+        [
+            [intrinsics.fx, 0.0,           intrinsics.ppx],
+            [0.0,           intrinsics.fy, intrinsics.ppy],
+            [0.0,           0.0,           1.0]
+        ],
+        dtype=np.float32
+    )
     try:
         dist = np.array(intrinsics.coeffs, dtype=np.float32).reshape(-1, 1)
     except Exception:
         dist = np.zeros((5, 1), dtype=np.float32)
-
+    
+    
+    # ==========================================================================
+    # TODO: Solve PnP to get rotation and translation
+    # ==========================================================================
+    # Hint: Use cv2.solvePnP()
+    # Returns: (success, rvec, tvec) where rvec is rotation vector, tvec is translation
+    # YOUR CODE HERE
     ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
     if not ok:
-        raise RuntimeError("solvePnP failed for sphere pose")
+        raise RuntimeError("solvePnP failed")
+    
+    # Convert rotation vector to rotation matrix (required return format)
+    rot_matrix, _ = cv2.Rodrigues(rvec)
+    
+    return rot_matrix, tvec
 
-    R, _ = cv2.Rodrigues(rvec)
-    return R, tvec  # tvec is (3,1) mm
 
-
-def detect_balls(image_bgr):
+def detect_balls(image):
     """
-    Detect colored balls via HSV segmentation + contour circularity.
-    Returns: list[(color_str, (cx, cy), r_px)]  OR  None if none found.
-    Also draws overlays to a "Detection" window for operator feedback.
+    Detect colored balls in the input image using computer vision.
+    
+    Pipeline:
+        1. Convert image to HSV color space for robust color detection
+        2. Detect circular shapes using Hough Circle Transform
+        3. For each detected circle:
+           - Extract the color by analyzing hue values
+           - Classify as red, orange, yellow, or blue
+           - Record position and radius
+    
+    Args:
+        image: BGR color image from camera
+    
+    Returns:
+        list: List of tuples (color, (cx, cy), radius) for each detected ball
+              Returns None if no balls detected
     """
-    blurred = cv2.GaussianBlur(image_bgr, (7, 7), 0)
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    # ==========================================================================
+    # TODO: DETECT CIRCULAR OBJECTS IN IMAGE
+    # ==========================================================================
+    # Implement your circle detection pipeline here. Consider approaches such as:
+    #   - Hough Circle Transform (cv2.HoughCircles)
+    #   - Contour detection (cv2.findContours) with circularity filtering
+    #   - Color-based segmentation followed by shape analysis
+    #   - Edge detection + morphological operations
+    #
+    # Your implementation should:
+    #   - Detect circles reliably under varying lighting conditions
+    #   - Handle multiple balls of different colors
+    #   - Return circle parameters (center x, y and radius) for each detection
+    #
+    # Recommended: Store results in a variable called 'circles' with format:
+    #              array of shape (1, N, 3) where each circle is [x, y, radius]
+    #              (This matches cv2.HoughCircles output format)
+    #
+    # Explore different preprocessing techniques and parameters!
+    # YOUR CODE HERE
+    blurred = cv2.GaussianBlur(image, (7, 7), 0)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 5)
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=30,
+        param1=120,
+        param2=30,
+        minRadius=10,
+        maxRadius=120
+    )
+    
+    # If no circles detected, show image and return None
+    if circles is None or len(circles[0]) == 0:
+        cv2.imshow('Detection', image)
+        cv2.waitKey(1)
+        return None
+    
+    # Convert circle parameters to integers
+    circles = np.uint16(np.around(circles))
+    
+    result = []  # List to store (color, center, radius) tuples
+    
+    # Process each detected circle
+    for circle in circles[0, :]:
+        center = (circle[0], circle[1])  # (cx, cy) in pixels
+        radius = circle[2]               # radius in pixels
 
-    ranges = {
-        "red":    [(np.array([  0, 120, 80]), np.array([ 10, 255, 255])),
-                   (np.array([170, 120, 80]), np.array([180, 255, 255]))],
-        "orange": [(np.array([ 10, 120, 80]), np.array([ 22, 255, 255]))],
-        "yellow": [(np.array([ 22,  80, 80]), np.array([ 35, 255, 255]))],
-        "blue":   [(np.array([ 90,  80, 80]), np.array([130, 255, 255]))],
-    }
+        # ======================================================================
+        # TODO: CLASSIFY BALL COLOR
+        # ======================================================================
+        # Determine the color of this detected circle. Approaches to consider:
+        #   - HSV color space analysis (hue values)
+        #
+        # Important: Focus analysis on pixels within the circle (using masks), not entire image
+        #
+        # Must classify as one of: 'red', 'orange', 'yellow', 'blue'
+        # Set variable 'color' to the classification result
+        # Use 'continue' to skip circles that don't match any target color
+        #
+        # Note: Red color may require special handling depending on color space!
+        #
+        # YOUR CODE HERE
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        mask_circle = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        cv2.circle(mask_circle, center, int(radius*0.8), 255, -1)
+        h_vals = hsv[:, :, 0][mask_circle == 255]
+        s_vals = hsv[:, :, 1][mask_circle == 255]
+        v_vals = hsv[:, :, 2][mask_circle == 255]
+        if h_vals.size == 0:
+            continue
+        h_mean = np.mean(h_vals)
+        s_mean = np.mean(s_vals)
+        v_mean = np.mean(v_vals)
+        if s_mean < 50 or v_mean < 50:
+            continue
 
-    kernel = np.ones((5, 5), np.uint8)
-    results = []
-
-    for cname, spans in ranges.items():
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lo, hi in spans:
-            mask |= cv2.inRange(hsv, lo, hi)
-
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < 200:
-                continue
-            perim = cv2.arcLength(c, True)
-            if perim <= 0:
-                continue
-            circ = 4.0 * np.pi * area / (perim ** 2)
-            if circ < 0.70:
-                continue
-
-            M = cv2.moments(c)
-            if M["m00"] == 0:
-                continue
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            r  = int(np.sqrt(area / np.pi))
-
-            # quick sanity using local HSV stats (avoid dull/gray blobs)
-            mask_circle = np.zeros_like(mask)
-            cv2.circle(mask_circle, (cx, cy), int(r * 0.8), 255, -1)
-            h = hsv[:, :, 0][mask_circle == 255]
-            s = hsv[:, :, 1][mask_circle == 255]
-            v = hsv[:, :, 2][mask_circle == 255]
-            if h.size == 0 or np.mean(s) < 50 or np.mean(v) < 50:
-                continue
-
-            results.append((cname, (cx, cy), r))
-
-            # overlays
-            cv2.circle(image_bgr, (cx, cy), r, (0, 255, 0), 2)
-            cv2.circle(image_bgr, (cx, cy), 3, (0, 0, 255), -1)
-            cv2.putText(image_bgr, cname, (cx - 20, cy - r - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-    cv2.imshow("Detection", image_bgr)
+        color = None
+        # Handle red wrap-around
+        if h_mean < 10 or h_mean > 170:
+            color = 'red'
+        elif 10 <= h_mean < 22:
+            color = 'orange'
+        elif 22 <= h_mean < 35:
+            color = 'yellow'
+        elif 90 <= h_mean < 130:
+            color = 'blue'
+        else:
+            continue
+        
+        # Add to results
+        result.append((color, center, radius))
+        
+        # ======================================================================
+        # TODO: Draw detection visualization on image
+        # ======================================================================
+        # Hint: Draw circle outline, center point, and color label
+        # Use cv2.circle() for shapes and cv2.putText() for text
+        # YOUR CODE HERE
+        cv2.circle(image, center, radius, (0, 255, 0), 2)  # Green circle
+        cv2.circle(image, center, 3, (0, 0, 255), -1)      # Red center dot
+        cv2.putText(image, color, (center[0] - 20, center[1] - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    # Display detection results
+    cv2.imshow('Detection', image)
     cv2.waitKey(1)
+    
+    return result if result else None
 
-    return results if results else None
 
+# ============================================================================
+# MOTION CONTROL: TRAJECTORY PLANNING AND EXECUTION
+# ============================================================================
 
-# =============================================================================
-# UTILS: SIMPLE POSITION TRAJECTORY (USED ONLY FOR TRANSPORT/HOME)
-# =============================================================================
-
-def move_trajectory(robot: Robot, target_pos, traj_time=TRAJECTORY_TIME, num_pts=NUM_POINTS):
+def move_trajectory(robot, target_pos, traj_time=TRAJECTORY_TIME):
     """
-    Simple linear interpolation in task space executed via IK.
-    Used for non-visual transport segments (to bins and home).
+    Move robot to target position using smooth quintic trajectory.
+    
+    This function:
+    1. Gets current robot position
+    2. Plans a quintic (5th-order polynomial) trajectory in task space
+    3. Converts entire trajectory to joint space using inverse kinematics
+    4. Executes trajectory with precise timing
+    
+    Args:
+        robot: Robot instance
+        target_pos: Target position [x, y, z, pitch] in mm and degrees
+        traj_time: Duration of trajectory in seconds
     """
+    # ==========================================================================
+    # TODO: Get current joint positions and end-effector position
+    # ==========================================================================
+    # YOUR CODE HERE
     readings = robot.get_joints_readings()
-    q_now = readings[0, :]                # deg
-    p_now = robot.get_ee_pos(q_now)[:4]   # [x,y,z,pitch]
-
-    target_pos = np.asarray(target_pos, dtype=float)
-    p_now = np.asarray(p_now, dtype=float)
-
-    waypoints = np.column_stack([
-        np.linspace(p_now[i], target_pos[i], num_pts) for i in range(4)
-    ])  # (num_pts, 4)
-
-    dt = traj_time / max(num_pts - 1, 1)
+    q_now = readings[0, :]
+    p_now = robot.get_ee_pos(q_now)[:4]
+    
+    
+    # ==========================================================================
+    # TODO: Create task-space trajectory from current to target position
+    # ==========================================================================
+    # Hint: Stack current_pos and target_pos, create TrajPlanner, call get_quintic_traj()
+    # YOUR CODE HERE
+    waypoints = np.vstack([p_now, np.asarray(target_pos, dtype=float)])
+    planner = TrajPlanner(waypoints, traj_time, num_points=NUM_POINTS)
+    p_traj = planner.get_quintic_traj()
+    
+    
+    # ==========================================================================
+    # TODO: Convert entire trajectory to joint space
+    # ==========================================================================
+    # YOUR CODE HERE
+    q_traj = np.array([robot.get_ik(p.tolist()) for p in p_traj])
+    
+    
+    # TODO: Calculate time step between waypoints
+    dt = traj_time / max(NUM_POINTS - 1, 1)
     robot.write_time(dt)
-
+    
+    # ==========================================================================
+    # TODO: Execute trajectory with precise timing (see Lab 4)
+    # ==========================================================================
+    # Hint: Record start time, then for each waypoint:
+    #   - Calculate target time for this waypoint
+    #   - Wait until that time
+    #   - Send joint commands
+    # This ensures smooth, consistent motion regardless of computation time
+    # YOUR CODE HERE
     t0 = time.time()
-    for i in range(num_pts):
-        q_cmd = robot.get_ik(waypoints[i].tolist())
+    for i, qcmd in enumerate(q_traj):
         t_target = t0 + i * dt
         while True:
             now = time.time()
-            if now >= t_target: break
+            if now >= t_target:
+                break
             time.sleep(max(0.0, t_target - now))
-        robot.write_joints(q_cmd)
+        robot.write_joints(qcmd)
 
 
-def place_ball(robot: Robot, color: str):
-    """Open-loop transport to bin; PBVS is not required once grasped."""
+# ============================================================================
+# PICK AND PLACE OPERATIONS
+# ============================================================================
+
+def pick_ball(robot, ball_pos):
+    """
+    Execute a pick operation to grasp a ball.
+    
+    Sequence:
+        1. Open gripper
+        2. Move to approach position (above ball)
+        3. Move down to grasp position
+        4. Close gripper
+        5. Lift ball to clear workspace
+    
+    Args:
+        robot: Robot instance
+        ball_pos: Ball position [x, y, z] in robot frame (mm)
+    """
+    print(f"Picking ball at {ball_pos}")
+    
+    # ==========================================================================
+    # Open gripper
+    # ==========================================================================
+    # Use robot.write_gripper(1) for open, wait for motion
+    robot.write_gripper(1)
+    time.sleep(0.5)
+    
+    # ==========================================================================
+    # Move to approach position (above the ball)
+    # ==========================================================================
+    # Create position [x, y, z_high, pitch] where z_high is ~100mm
+    # Use steep pitch angle (e.g., -80°) for vertical approach
+    approach = [ball_pos[0], ball_pos[1], 100, -80]   # may need tuning
+    move_trajectory(robot, approach, TRAJECTORY_TIME)
+    
+    # ==========================================================================
+    # Move down to grasp position
+    # ==========================================================================
+    # Lower z to just above table surface (e.g., 39mm for 30mm ball radius)
+    # Adjust this height based on your table height and ball size!
+    grasp = [ball_pos[0], ball_pos[1], 39, -80]       # may need tuning
+    move_trajectory(robot, grasp, TRAJECTORY_TIME * 0.5)
+    
+    # ==========================================================================
+    # Close gripper to grasp ball
+    # ==========================================================================
+    #  Use robot.write_gripper(0) for close, wait for secure grasp
+    robot.write_gripper(0)
+    time.sleep(1)
+    
+    # ==========================================================================
+    # Lift ball to clear workspace
+    # ==========================================================================
+    # Move back up to approach height
+    lift = [ball_pos[0], ball_pos[1], 100, -80] # may need tuning
+    move_trajectory(robot, lift, TRAJECTORY_TIME * 0.5)
+
+
+def place_ball(robot, color):
+    """
+    Place ball in the appropriate color-coded bin.
+    
+    Args:
+        robot: Robot instance
+        color: Ball color string ('red', 'orange', 'yellow', 'blue')
+    """
     print(f"Placing {color} ball")
-    move_trajectory(robot, BINS[color], TRAJECTORY_TIME)
-    robot.write_gripper(1)  # release
-    time.sleep(1.0)
+    
+    # ==========================================================================
+    # Get bin position for this color
+    # ==========================================================================
+    # Look up position in BINS dictionary
+    bin_pos = BINS[color]
+    
+    # ==========================================================================
+    # Move to bin location
+    # ==========================================================================
+    move_trajectory(robot, bin_pos, TRAJECTORY_TIME)
+    
+    # ==========================================================================
+    # Release ball by opening gripper
+    # ==========================================================================
+    robot.write_gripper(1)
+    time.sleep(1)
 
 
-def go_home(robot: Robot):
+def go_home(robot):
+    """
+    Return robot to home position for next detection cycle.
+    
+    Args:
+        robot: Robot instance
+    """
     move_trajectory(robot, HOME_POSITION, TRAJECTORY_TIME)
 
 
-# =============================================================================
-# PBVS CORE
-# =============================================================================
-
-class PBVSController:
-    """
-    PID in task space: v = Kp e + Ki int(e) + Kd de/dt
-    Velocity allocation: qdot = J_v^# v
-    """
-    def __init__(self, dt=DT, Kp=Kp, Ki=Ki, Kd=Kd, vel_clamp=VEL_CLAMP, deadband=VEL_DEADBAND):
-        self.dt = dt
-        self.Kp = Kp
-        self.Ki = Ki
-        self.Kd = Kd
-        self.vel_clamp = vel_clamp
-        self.deadband = deadband
-
-        self.e_int = np.zeros(3)
-        self.e_prev = np.zeros(3)
-
-    def step(self, robot: Robot, p_des_mm: np.ndarray):
-        # current joints/pose
-        readings = robot.get_joints_readings()
-        q_deg = readings[0, :]
-        p_cur = robot.get_ee_pos(q_deg)[:3]   # mm
-
-        # PID
-        e = (p_des_mm - p_cur).astype(float)  # mm
-        self.e_int += e * self.dt
-        e_dot = (e - self.e_prev) / self.dt
-        self.e_prev = e.copy()
-
-        v = (self.Kp @ e) + (self.Ki @ self.e_int) + (self.Kd @ e_dot)  # mm/s
-
-        # Jacobian + allocation
-        J = robot.get_jacobian(q_deg)[:3, :]   # 3x4
-        Jpinv = np.linalg.pinv(J, rcond=1e-3)
-        qdot_rad = (Jpinv @ v.reshape(3, 1)).reshape(4)
-
-        # safety shaping
-        qdot_deg = np.degrees(qdot_rad)
-        qdot_deg = np.clip(qdot_deg, -self.vel_clamp, self.vel_clamp)
-        qdot_deg[np.abs(qdot_deg) < self.deadband] = 0.0
-
-        return e, qdot_deg
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
+# ============================================================================
+# MAIN CONTROL LOOP
+# ============================================================================
 
 def main():
-    print("=" * 60)
-    print("Lab 8 (Option 2): Position-Based Visual Servoing")
-    print("=" * 60)
-
-    # --- Initialize devices ---
+    """
+    Main control loop for the robotic sorting system.
+    
+    Workflow:
+        1. Initialize robot, camera, and calibration
+        2. Move to home position
+        3. Loop:
+           a. Capture image and detect balls
+           b. Convert detected positions to robot frame
+           c. Filter balls within workspace
+           d. Pick and place first ball
+           e. Repeat
+    """
+    print("="*60)
+    print("Lab 8: Robotic Sorting System")
+    print("="*60)
+    
+    # ==========================================================================
+    # INITIALIZATION
+    # ==========================================================================
+    
+    # TODO: Initialize robot, camera, and get intrinsics
+    # Hint: Create Robot(), Realsense(), and get intrinsics
+    # YOUR CODE HERE
     robot = Robot()
     camera = Realsense()
     intrinsics = camera.get_intrinsics()
-
-    # --- Calibration: camera → robot transform ---
+    
+    
+    # ==========================================================================
+    # TODO: Load camera-robot calibration matrix
+    # ==========================================================================
+    # Hint: Use np.load() to load 'camera_robot_transform.npy'
+    # This matrix transforms points from camera frame to robot frame
+    # YOUR CODE HERE
     T_cam_to_robot = np.load('camera_robot_transform.npy')
-
-    # --- Move to home in position mode ---
+    
+    
+    # ==========================================================================
+    # TODO: Setup robot in position control mode
+    # ==========================================================================
+    # Hint: Set mode to "position", enable motors, set default trajectory time
+    # YOUR CODE HERE
     robot.write_mode("position")
     robot.write_time(2.0)
+    
+    
+    # ==========================================================================
+    # TODO: Move to home position
+    # ==========================================================================
+    # Hint: Use inverse kinematics to find joint angles, then command them
+    # YOUR CODE HERE
     q_home = robot.get_ik(HOME_POSITION)
     robot.write_joints(q_home)
     time.sleep(2.5)
-
-    # --- Open gripper to start ---
+    
+    
+    # ==========================================================================
+    # TODO: Open gripper initially
+    # ==========================================================================
+    # YOUR CODE HERE
     robot.write_gripper(1)
     time.sleep(0.5)
-
-    print("\nReady. Press Ctrl+C to stop.\n")
-
-    pbvs = PBVSController(dt=DT, Kp=Kp, Ki=Ki, Kd=Kd)
-
+    
+    
+    print(f"\nReady! Using TRAJECTORY control")
+    print("Press Ctrl+C to stop\n")
+    
+    # ==========================================================================
+    # MAIN CONTROL LOOP
+    # ==========================================================================
+    
     try:
         iteration = 0
+        
         while True:
             print(f"\n{'='*60}")
             print(f"Iteration {iteration}")
-
-            # 1) Grab a frame
+            
+            # ==================================================================
+            # STEP 1: CAPTURE IMAGE AND DETECT BALLS
+            # ==================================================================
+            
+            # TODO: Get camera frame
+            # Hint: Use camera.get_frames() which returns (color, depth)
+            # YOUR CODE HERE
             color_frame, _ = camera.get_frames()
             if color_frame is None:
                 print("No camera frame")
                 time.sleep(0.2)
                 iteration += 1
                 continue
-
-            # 2) Detect balls
-            detections = detect_balls(color_frame)
-            if not detections:
+            
+            
+            # TODO: Detect balls in image
+            # Hint: Call detect_balls() function
+            # YOUR CODE HERE
+            spheres = detect_balls(color_frame)
+            
+            # Check if any balls detected
+            if spheres is None:
                 print("No balls detected")
-                time.sleep(0.5)
+                time.sleep(1)
                 iteration += 1
                 continue
-
-            # 3) Convert first in-workspace ball to robot frame
-            target = None
-            for color, (cx, cy), rpx in detections:
-                # build 4 corners for PnP (left, right, bottom, top)
-                corners = np.array([
-                    [cx - rpx, cy],
-                    [cx + rpx, cy],
-                    [cx,       cy + rpx],
-                    [cx,       cy - rpx]
-                ], dtype=np.float32)
-
+            
+            print(f"Detected {len(spheres)} ball(s)")
+            
+            # ==================================================================
+            # STEP 2: CONVERT DETECTIONS TO ROBOT FRAME
+            # ==================================================================
+            
+            robot_spheres = []  # List to store (color, robot_position) tuples
+            
+            for color, (cx, cy), radius in spheres:
+                
+                # ==============================================================
+                # TODO: Create corner points for PnP algorithm
+                # ==============================================================
+                # Hint: Create 4 points at [left, right, bottom, top] of circle
+                # Format: [[cx - radius, cy], [cx + radius, cy], ...]
+                # YOUR CODE HERE
+                corners = np.array(
+                    [
+                        [cx - radius, cy],   # left
+                        [cx + radius, cy],   # right
+                        [cx, cy + radius],   # bottom
+                        [cx, cy - radius],   # top
+                    ],
+                    dtype=np.float32
+                )
+                
+                
+                # ==============================================================
+                # TODO: Get 3D position in camera frame using PnP
+                # ==============================================================
+                # Hint: Call get_ball_pose() with corners, intrinsics, and BALL_RADIUS
+                # Returns (rotation, translation) - we only need translation
+                # YOUR CODE HERE                
                 _, tvec = get_ball_pose(corners, intrinsics, BALL_RADIUS)
-                cam_pos = tvec.reshape(3)                         # mm
+                cam_pos = tvec.reshape(3)
+                
+                # ==============================================================
+                # TODO: Transform position to robot frame
+                # ==============================================================
+                # Hint: 
+                #   1. Flatten cam_pos and append 1 for homogeneous coordinates
+                #   2. Multiply by transformation matrix: T_cam_to_robot @ pos_hom
+                #   3. Extract first 3 elements for 3D position
+                # YOUR CODE HERE
                 pos_h = np.hstack([cam_pos, 1.0]).reshape(4, 1)
                 rob_h = T_cam_to_robot @ pos_h
-                robot_pos = rob_h[:3, 0].astype(float)            # mm
-
-                if X_MIN <= robot_pos[0] <= X_MAX and Y_MIN <= robot_pos[1] <= Y_MAX:
-                    target = (color, (cx, cy, rpx), robot_pos)
-                    print(f"Target {color} at robot {robot_pos}")
-                    break
-
-            if target is None:
-                print("No valid targets in workspace")
-                time.sleep(0.5)
+                robot_pos = rob_h[:3, 0].astype(float)
+                
+                
+                # ==============================================================
+                # Check if position is within workspace bounds
+                # ==============================================================
+                # Check if X_MIN <= x <= X_MAX and Y_MIN <= y <= Y_MAX
+                # Skip balls outside workspace for safety
+                if not (X_MIN <= robot_pos[0] <= X_MAX and 
+                        Y_MIN <= robot_pos[1] <= Y_MAX):
+                    print(f"  Skipping {color} ball outside workspace: {robot_pos}")
+                    continue
+                
+                
+                robot_spheres.append((color, robot_pos))
+                print(f"  {color}: {robot_pos}")
+            
+            # Check if any valid balls found
+            if not robot_spheres:
+                print("No balls in workspace")
+                time.sleep(1)
                 iteration += 1
                 continue
-
-            target_color, (cx0, cy0, r0), target_pos_robot = target
-
-            # 4) Switch to velocity mode for PBVS phases
-            robot.write_mode("velocity")
-            time.sleep(0.1)
-
-            # ---- PBVS Phase A: APPROACH (keep tag visible) ----
-            print("PBVS: approach")
-            t_start = time.time()
-            while True:
-                # Re-detect target color to refresh target_pos_robot
-                frame, _ = camera.get_frames()
-                det = detect_balls(frame)
-                if det:
-                    same = [d for d in det if d[0] == target_color]
-                    # Pick closest in pixel space to original centroid
-                    if same:
-                        cx, cy, rpx = min(((d[1][0], d[1][1], d[2]) for d in same),
-                                          key=lambda P: (P[0]-cx0)**2 + (P[1]-cy0)**2)
-                        corners = np.array([[cx - rpx, cy], [cx + rpx, cy],
-                                            [cx, cy + rpx], [cx, cy - rpx]], dtype=np.float32)
-                        _, tvec = get_ball_pose(corners, intrinsics, BALL_RADIUS)
-                        cam_pos = tvec.reshape(3)
-                        pos_h = np.hstack([cam_pos, 1.0]).reshape(4, 1)
-                        rob_h = T_cam_to_robot @ pos_h
-                        target_pos_robot = rob_h[:3, 0].astype(float)
-
-                p_des = target_pos_robot + APPROACH_OFFSET
-                e, qdot_deg = pbvs.step(robot, p_des)
-                robot.write_velocities(qdot_deg.tolist())
-
-                if np.linalg.norm(e) < 5.0:  # mm
-                    break
-                if time.time() - t_start > 6.0:
-                    break
-                time.sleep(DT)
-
-            # ---- PBVS Phase B: DESCEND to GRASP_Z ----
-            print("PBVS: descend")
-            t_start = time.time()
-            while True:
-                p_des = np.array([target_pos_robot[0], target_pos_robot[1], GRASP_Z])
-                e, qdot_deg = pbvs.step(robot, p_des)
-                robot.write_velocities(qdot_deg.tolist())
-
-                if np.linalg.norm(e) < 3.0:
-                    break
-                if time.time() - t_start > 4.0:
-                    break
-                time.sleep(DT)
-
-            # Grasp
-            robot.write_velocities([0, 0, 0, 0])
-            robot.write_gripper(0)   # close
-            time.sleep(1.0)
-
-            # ---- PBVS Phase C: LIFT to LIFT_Z ----
-            print("PBVS: lift")
-            t_start = time.time()
-            while True:
-                p_des = np.array([target_pos_robot[0], target_pos_robot[1], LIFT_Z])
-                e, qdot_deg = pbvs.step(robot, p_des)
-                robot.write_velocities(qdot_deg.tolist())
-
-                if np.linalg.norm(e) < 4.0:
-                    break
-                if time.time() - t_start > 4.0:
-                    break
-                time.sleep(DT)
-
-            # Stop PBVS and switch back to position mode for transport
-            robot.write_velocities([0, 0, 0, 0])
-            robot.write_mode("position")
-            time.sleep(0.2)
-
-            # 5) Transport to bin and release
-            place_ball(robot, target_color)
-
-            # 6) Return home
+            
+            # ==================================================================
+            # STEP 3: PICK AND PLACE FIRST BALL
+            # ==================================================================
+            
+            # Get first ball from list
+            color, pos = robot_spheres[0]
+            
+            print(f"\nSorting {color} ball at {pos}")
+            
+            # TODO: Execute pick-and-place sequence
+            # Hint: Call pick_ball(), place_ball(), and go_home()
+            # YOUR CODE HERE
+            pick_ball(robot, pos)
+            place_ball(robot, color)
             go_home(robot)
-
+            
+            
             iteration += 1
-            time.sleep(0.4)
-
+            time.sleep(1)  # Brief pause before next cycle
+    
     except KeyboardInterrupt:
-        print("\nStopped by user")
+        print("\n\nStopped by user")
+    
     except Exception as e:
-        print(f"\nError: {e}")
+        print(f"\nError occurred: {e}")
         import traceback
         traceback.print_exc()
+    
     finally:
+        # Cleanup
         print("\nCleaning up...")
+        # TODO: stop the camera
         try:
             camera.stop()
         except Exception:
             pass
+        
         cv2.destroyAllWindows()
         print("Done!")
 
+
+# ============================================================================
+# PROGRAM ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
     main()
